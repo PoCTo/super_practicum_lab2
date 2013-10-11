@@ -2,7 +2,10 @@
 #pragma comment(lib, "cxx.lib")
 
 #define MASTER_NODE 0 
-#define MAX_ABS_ELEMENT_VALUE 100
+#define SEND_MATRIX_TAG 1
+#define SEND_ANSWER_MATRIX_TAG 3
+
+#define MAX_ABS_ELEMENT_VALUE 10
 
 #include <iostream>
 #include <fstream>
@@ -13,55 +16,55 @@
 #include <ctime>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 #include <mpi.h>
 #include <omp.h>
 
 using std::cout;
 using std::endl;
+using std::vector;
 
-int** generateMatrix(int size, bool fillRandom = false) {
-    int** matrix = (int**)std::malloc(size * sizeof(int*));
-    for (int i = 0; i < size; ++i) {
-        matrix[i] = (int*)std::malloc(size * sizeof(int));
-    }    
+double fRand(double fMin, double fMax)
+{
+    double f = (double)rand() / RAND_MAX;
+    return fMin + f * (fMax - fMin);
+}
+
+double* generateMatrix(int size, bool fillRandom = false) {
+    double* matrix = (double*)std::malloc(size * size * sizeof(double)); 
 
     if (fillRandom) {
-        for (int i = 0; i < size; ++i) {
-            for (int j = 0; j < size; ++j) {
-                matrix[i][j] = rand() % (2 * MAX_ABS_ELEMENT_VALUE + 1) - MAX_ABS_ELEMENT_VALUE;
-            }
+        for (int i = 0; i < size * size; ++i) {
+            matrix[i] = fRand(-MAX_ABS_ELEMENT_VALUE, MAX_ABS_ELEMENT_VALUE);
         }
     }
 
     return matrix;
 }
 
-void destroyMatrix(int** matrix, int size) {
-    for (int i = 0; i < size; ++i) {
-        std::free(matrix[i]);
-    }    
+void destroyMatrix(double* matrix) {
     free(matrix);
 }
 
-void printMatrix(int** matrix, int size) {
+void printMatrix(double* matrix, int size) {
     for (int i = 0; i < size; ++i) {
         for (int j = 0; j < size; ++j) {
-            cout << matrix[i][j] << " ";       
+            cout << matrix[i * size + j] << " ";       
         }
         cout << endl;
     }
 }
 
-void multiplyMatrices(int** A, int** B, int**C, int size, int ompCount = 1) {
-    int oldOmpCount = omp_get_num_threads();
-    omp_set_num_threads(ompCount);
+void multiplyMatrices(double* A, double* B, double* C, int size, size_t ompCount = 1) {    
+    size_t oldOmpCount = omp_get_num_threads();
+    omp_set_num_threads(ompCount);    
 #pragma omp parallel for
-    for (int i = 0; i < size; i++) {
-        for (int j = 0; j < size; j++) {
-            C[i][j] = 0;    
-            for (int k = 0; k < size; k++) {
-                C[i][j] += A[i][k] * B[k][j];
+    for (int i = 0; i < size; ++i) {
+        for (int j = 0; j < size; ++j) {            
+            C[i * size + j] = 0;    
+            for (int k = 0; k < size; ++k) {
+                C[i * size + j] += A[i * size + k] * B[k * size + j];                
             }
         } 
     }
@@ -69,22 +72,18 @@ void multiplyMatrices(int** A, int** B, int**C, int size, int ompCount = 1) {
 }
 
 int main(int argc, char** argv) {
-	double globalsum;
-	int generateByNode;
 	double startWtime = 0;
-	double endWtime;
-	int globalBinSizes[100];
 
 	MPI::Init(argc, argv);
 
-    int **matrixA, **matrixB, **matrixC;
+    double *matrixA = NULL, *matrixB = NULL, *matrixC = NULL;
 
-    int nOMP = std::atoi(argv[1]);
-	int mSize = std::atoi(argv[2]);
-	bool check = std::atoi(argv[2]) == 1;
+    size_t nOMP = std::atoi(argv[1]);
+	size_t mSize = std::atoi(argv[2]);
+	bool check = std::atoi(argv[3]) == 1;
 
-	int numProcs = MPI::COMM_WORLD.Get_size();
-	int nodeId = MPI::COMM_WORLD.Get_rank();
+	size_t numProcs = MPI::COMM_WORLD.Get_size();
+	size_t nodeId = MPI::COMM_WORLD.Get_rank();
 
 	omp_set_dynamic(0);
 
@@ -114,6 +113,8 @@ int main(int argc, char** argv) {
         matrixA = generateMatrix(mSize, true);
         matrixB = generateMatrix(mSize, true);
         matrixC = generateMatrix(mSize, false);
+    } else {
+        matrixB = generateMatrix(mSize, false);
     }
 
 #ifdef _DEBUG
@@ -128,15 +129,95 @@ int main(int argc, char** argv) {
 		startWtime = MPI::Wtime();
 	}
 
-    
+    if (numProcs == 1) {
+        
+        if (nodeId == MASTER_NODE) {
+            
+            multiplyMatrices(matrixA, matrixB, matrixC, mSize, nOMP);
+        }
+    } else {
+        size_t numWorkingProcs = numProcs;
+        if (numProcs > mSize + 1) {
+            numWorkingProcs = mSize + 1;
+        }
+        size_t sliceSize = mSize / (numWorkingProcs - 1);
+        MPI::COMM_WORLD.Bcast(matrixB, mSize * mSize, MPI::DOUBLE, MASTER_NODE);
+        if (nodeId == MASTER_NODE) {             
+            for (size_t i = 0; i + 1 < numWorkingProcs; ++i) {
+                size_t from = i * sliceSize;
+                size_t to = (i + 1) * sliceSize;
+                if (i + 1 == numWorkingProcs - 1 && to != mSize) {
+                    to = mSize;
+                }
+                size_t elementsCount = (to - from) * mSize;
 
+                MPI::COMM_WORLD.Isend(matrixA + from * mSize, elementsCount, MPI::DOUBLE, i + 1, SEND_MATRIX_TAG);
+            }
+            for (size_t i = 0; i + 1 < numWorkingProcs; ++i) {
+                size_t from = i * sliceSize;
+                size_t to = (i + 1) * sliceSize;                
+                if (i + 1 == numWorkingProcs - 1 && to != mSize) {
+                    to = mSize;
+                }
+                size_t elementsCount = (to - from) * mSize;
+                MPI::COMM_WORLD.Recv(matrixC + from * mSize, elementsCount, MPI::DOUBLE, i + 1, SEND_ANSWER_MATRIX_TAG);
+            }
+        } else if (nodeId < numWorkingProcs) {
+            size_t from = (nodeId - 1) * sliceSize;
+            size_t to = nodeId * sliceSize;            
+            if (nodeId == numWorkingProcs - 1 && to != mSize) {
+                to = mSize;
+            }
+            size_t elementsCount = (to - from) * mSize;
+            double* matrixRes = (double*)malloc(elementsCount * sizeof(double));
+            double* matrixAslice = (double*)malloc(elementsCount * sizeof(double));     
+            MPI::COMM_WORLD.Recv(matrixAslice, elementsCount, MPI::DOUBLE, MASTER_NODE, SEND_MATRIX_TAG);
+            for (int i = 0; i + from < to; ++i) {
+                #pragma omp parallel for
+                for (int j = 0; j < (int)mSize; ++j) {
+                    matrixRes[i * mSize + j] = 0;
+                    for (int k = 0; k < (int)mSize; ++k) {
+                        matrixRes[i * mSize + j] += matrixAslice[i * mSize + k] * matrixB[k * mSize + j];
+                    }
+                }
+            }
 
+            MPI::Request req = MPI::COMM_WORLD.Isend(matrixRes, elementsCount, MPI::DOUBLE, 0, SEND_ANSWER_MATRIX_TAG);
+            
+            free(matrixAslice);
+            req.Wait();
+            free(matrixRes);            
+        }
+    }
+
+#ifdef _DEBUG
+    if (nodeId == MASTER_NODE) {       
+        cout << "Master: multiplied matrices, got C = " << endl;
+        printMatrix(matrixC, mSize);
+    }
+#endif
+
+    if (check) {
+        if (nodeId == MASTER_NODE) {
+            double* matrixC2 = generateMatrix(mSize, false);
+            multiplyMatrices(matrixA, matrixB, matrixC2, mSize, 1);
+#ifdef _DEBUG
+            cout << "Master: checked multiplied matrices, got C = " << endl;
+            printMatrix(matrixC2, mSize);
+#endif
+        }
+    }
 
     if (nodeId == MASTER_NODE) {
-        
-        destroyMatrix(matrixA, mSize);
-        destroyMatrix(matrixB, mSize);
-        destroyMatrix(matrixC, mSize);
+        destroyMatrix(matrixA);
+        destroyMatrix(matrixB);
+        destroyMatrix(matrixC);
+    } else {
+        destroyMatrix(matrixB);
+    }
+
+    if (nodeId == MASTER_NODE) {
+        cout << MPI::Wtime() - startWtime << endl;
     }
 
 	MPI::Finalize();
